@@ -21,7 +21,22 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { Text } from "@oh-my-pi/pi-tui";
+import { type AutocompleteItem, type Component, Text, visibleWidth } from "@oh-my-pi/pi-tui";
+import { item, list } from "@oh-my-pi/pi-tui/native/describe";
+import { plainText } from "@oh-my-pi/pi-tui/native/spans";
+import {
+	createCachedComponent,
+	Ellipsis,
+	formatExpandHint,
+	PREVIEW_LIMITS,
+	renderStatusLine,
+	replaceTabs,
+	truncateToWidth,
+} from "@oh-my-pi/pi-tui/render";
+import { wrapPrefixedLine } from "@oh-my-pi/pi-tui/render/hanging-wrap";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { NativeToolView } from "@oh-my-pi/pi-tui/tools";
+import { errorView, resultText, toolHead } from "@oh-my-pi/pi-tui/tools/native-view";
 
 const MEMO = (process.env.OPTMEM_MEMO || "~/.optmem/memo").replace(/^~(?=\/|$)/, os.homedir());
 const MEMORY_DIR = (process.env.MEMORY_DIR || "~/.optmem/memory").replace(/^~(?=\/|$)/, os.homedir());
@@ -37,6 +52,21 @@ const SHUTDOWN_DRAIN_MS = 20_000;
 const NOTHING_PENDING = "Nothing left to compress.";
 const NAP_ROLES = ["@optmem", "@smol"];
 const TOOL_NAMES = ["memo_note", "memo_recall", "memo_zoom", "memo_forget"];
+/** `/memo` subcommands offered by argument completion; `usage` is the ghost-text hint. */
+const SUBCOMMANDS: Record<string, { usage?: string; description: string }> = {
+	recall: { usage: "<regex>", description: "search every memory ever recorded, by regex" },
+	zoom: { usage: "<lo>-<hi>", description: "open a tree node into its two halves" },
+	note: { usage: '"<one line>"', description: "record one memory: one short line" },
+	forget: { usage: "<lo>-<hi>", description: "drop a bad summary; it is rebuilt in the background" },
+	config: { usage: "[NAME=N]", description: "show this memory's sizes, or change one" },
+	wake: { description: "read the memory (all parts are already in the system prompt)" },
+	nap: { description: "show the pending compressions (the worker answers them)" },
+	init: { description: "create the memory" },
+	import: { usage: "<file>", description: "bulk-load dated memories from a file (bootstrap only)" },
+	help: { description: "show memo usage" },
+};
+/** Block ids offered while completing `/memo zoom|forget`. */
+const MAX_BLOCK_COMPLETIONS = 64;
 /** memo commands that can leave compressions pending. */
 const NAP_TRIGGERS: Record<string, true> = { init: true, note: true, forget: true, import: true };
 /** A shell or Python invocation of the memo script, by path or bare name. */
@@ -71,10 +101,104 @@ function text(t: string) {
 	return { content: [{ type: "text" as const, text: t }] };
 }
 
-/** Drop the compression request memo appends after `note`/`wake`: the worker answers it. */
+/**
+ * Drop the compression instructions memo appends after `note`/`forget`/`wake`
+ * (the request block, or forget's trailing `Run: memo nap`): the worker answers them.
+ */
 function withoutNapRequest(out: string): string {
 	const at = out.search(/^Compress memories #/m);
-	return at < 0 ? out : out.slice(0, at).trimEnd();
+	return (at < 0 ? out : out.slice(0, at)).replace(/\s*Run: \S*memo nap\s*$/, "").trimEnd();
+}
+
+// ------------------------------------------------------------ rendering
+
+/** A memo reply split for display: a short header fact, then rows under it. */
+interface MemoView {
+	meta?: string;
+	rows: string[];
+	/** Rows shown while collapsed. */
+	preview: number;
+	warn?: boolean;
+}
+
+type ToolResultView = { content: { type: string; text?: string }[]; isError?: boolean };
+
+/** Header plus rows, clamped to `preview` while collapsed and word-wrapped when expanded. */
+function memoLines(
+	header: string,
+	view: MemoView,
+	expanded: boolean,
+	width: number,
+	theme: Theme,
+	style: { bullet: boolean; color: "toolOutput" | "error" },
+): string[] {
+	const lines = [truncateToWidth(header, width, Ellipsis.Unicode)];
+	const shown = expanded ? view.rows : view.rows.slice(0, view.preview);
+	const prefix = style.bullet ? `  ${theme.fg("muted", theme.format.bullet)} ` : "  ";
+	const hang = " ".repeat(visibleWidth(prefix));
+	for (const row of shown) {
+		const value = theme.fg(style.color, replaceTabs(row));
+		if (expanded) lines.push(...wrapPrefixedLine(prefix, hang, value, width));
+		else lines.push(truncateToWidth(`${prefix}${value}`, width, Ellipsis.Unicode));
+	}
+	const hidden = view.rows.length - shown.length;
+	if (hidden > 0) {
+		lines.push(
+			truncateToWidth(`  ${theme.fg("dim", `… ${hidden} more`)} ${formatExpandHint(theme, expanded, true)}`, width, Ellipsis.Omit),
+		);
+	}
+	return lines;
+}
+
+/**
+ * Renderers matching omp's built-in memory tools: one status line (pending, then
+ * the memory glyph, or a warning/error icon) that the result replaces in place,
+ * rows under it, and the semantic view for TSP terminals and HTML export.
+ */
+function memoToolView<A>(title: string, describe: (args: A) => string, parse: (out: string, args?: A) => MemoView) {
+	const subject = (args: A | undefined) => {
+		const s = args ? replaceTabs(describe(args).trim()) : "";
+		return s ? truncateToWidth(s, 80, Ellipsis.Unicode) : undefined;
+	};
+	return {
+		// Read by omp at runtime (copied onto the tool adapter); not in ToolDefinition's typings.
+		mergeCallAndResult: true,
+		renderCall: (args: A, _options: unknown, theme: Theme): Component =>
+			new Text(renderStatusLine({ icon: "pending", title, description: subject(args) }, theme), 0, 0),
+		renderResult: (result: ToolResultView, options: { expanded: boolean }, theme: Theme, args?: A): Component => {
+			const out = resultText(result).trim();
+			const failed = result.isError === true;
+			const view: MemoView = failed ? { rows: out.split("\n"), preview: Infinity } : parse(out, args);
+			const header = renderStatusLine(
+				{
+					icon: failed ? "error" : view.warn ? "warning" : undefined,
+					iconOverride: failed || view.warn ? undefined : theme.styledSymbol("tool.memory", "accent"),
+					title,
+					description: subject(args),
+					meta: view.meta ? [view.meta] : undefined,
+				},
+				theme,
+			);
+			const style = { bullet: !failed, color: failed ? ("error" as const) : ("toolOutput" as const) };
+			return createCachedComponent(
+				() => options.expanded,
+				(width, expanded) => memoLines(header, view, expanded, width, theme, style),
+			);
+		},
+		describeCall: (args: A): NativeToolView => ({ head: toolHead(title, subject(args)), inline: true }),
+		describeResult: (result: ToolResultView, _options: unknown, args?: A): NativeToolView => {
+			const out = resultText(result).trim();
+			if (result.isError) return { ...errorView(title, out, subject(args)), inline: true };
+			const view = parse(out, args);
+			return {
+				head: toolHead(title, subject(args), view.meta),
+				tone: view.warn ? "warning" : undefined,
+				inline: true,
+				body: view.rows.length ? [list(view.rows.map((row, i) => item(String(i), { label: plainText(row) })))] : [],
+				preview: { lines: view.preview },
+			};
+		},
+	};
 }
 
 export default function omptmem(pi: ExtensionAPI) {
@@ -83,6 +207,79 @@ export default function omptmem(pi: ExtensionAPI) {
 	let naps: Promise<void> = Promise.resolve();
 	let napState = "";
 	const sessionNotes: string[] = [];
+	/** Memory count as of the last status update. */
+	let memoryCount = 0;
+	/** Built summaries seen in wake/zoom output, `lo-hi` → text: completion labels and forget targets. */
+	const summaries = new Map<string, string>();
+	/** `memo config` rows, `NAME` → `value  meaning`. */
+	const knobs = new Map<string, string>();
+
+	function rememberSummaries(out: string): void {
+		for (const m of out.matchAll(/^#(\d+-\d+) (.+)$/gm)) {
+			if (m[2] !== "not compressed yet") summaries.set(m[1]!, m[2]!);
+		}
+	}
+
+	/** Keep completion state in step with what memo printed. */
+	function observe(args: string[], r: MemoRun): void {
+		if (r.code !== 0) return;
+		const [cmd, arg] = args;
+		if (cmd === "zoom") rememberSummaries(r.out);
+		if (cmd === "config") {
+			for (const m of r.out.matchAll(/^([A-Z_]+)\s+(\d+)\s+(.+)$/gm)) knobs.set(m[1]!, `${m[2]}  ${m[3]}`);
+		}
+		if (cmd === "forget" && arg) {
+			// forget drops the block and every summary built on it: each block containing it.
+			const [lo = 0, hi = 0] = arg.split("-").map(Number);
+			for (const id of summaries.keys()) {
+				const [a = 0, b = 0] = id.split("-").map(Number);
+				if (a <= lo && b >= hi) summaries.delete(id);
+			}
+		}
+	}
+
+	/** `/memo` completion: subcommands, then block ids (from this memory) and config names. */
+	function completeArgs(prefix: string): AutocompleteItem[] | null {
+		const space = prefix.indexOf(" ");
+		if (space < 0) {
+			const typed = prefix.toLowerCase();
+			const items = Object.entries(SUBCOMMANDS)
+				.filter(([name]) => name.startsWith(typed))
+				.map(([name, s]) => ({
+					value: `${name} `,
+					label: name,
+					description: s.description,
+					hint: name.slice(typed.length) + (s.usage ? ` ${s.usage}` : "") || undefined,
+				}));
+			return items.length ? items : null;
+		}
+		const sub = prefix.slice(0, space).toLowerCase();
+		const arg = prefix.slice(space + 1);
+		if (/\s/.test(arg)) return null;
+		const items: AutocompleteItem[] = [];
+		if (sub === "zoom" || sub === "forget") {
+			const want = arg.replace(/^#/, "");
+			const offer = (id: string) => {
+				if (items.length >= MAX_BLOCK_COMPLETIONS || !id.startsWith(want) || items.some(i => i.label === `#${id}`)) return;
+				const [lo = 0, hi = 0] = id.split("-").map(Number);
+				const held = Math.min(hi + 1, memoryCount) - lo;
+				items.push({ value: `${sub} ${id}`, label: `#${id}`, description: summaries.get(id) ?? `${held} memories, not compressed yet` });
+			};
+			// Summaries wake printed first, as the agent sees them; zoom reaches any block.
+			for (const id of summaries.keys()) offer(id);
+			if (sub === "zoom") {
+				for (let size = 2 ** Math.ceil(Math.log2(Math.max(2, memoryCount))); size >= 2; size /= 2) {
+					for (let lo = 0; lo < memoryCount && items.length < MAX_BLOCK_COMPLETIONS; lo += size) offer(`${lo}-${lo + size - 1}`);
+				}
+			}
+		} else if (sub === "config") {
+			const name = arg.split("=")[0]!.toUpperCase();
+			for (const [knob, about] of knobs) {
+				if (knob.startsWith(name)) items.push({ value: `config ${knob}=`, label: knob, description: about });
+			}
+		}
+		return items.length ? items : null;
+	}
 
 	async function memo(args: string[], signal?: AbortSignal): Promise<MemoRun> {
 		const r = await pi.exec(MEMO, args, { timeout: EXEC_TIMEOUT_MS, signal });
@@ -115,7 +312,16 @@ export default function omptmem(pi: ExtensionAPI) {
 	async function updateStatus(ctx: ExtensionContext): Promise<void> {
 		const size = await fs.stat(path.join(MEMORY_DIR, "LOG.txt")).then(s => s.size, () => undefined);
 		if (size === undefined) return ctx.ui.setStatus("optmem", undefined);
-		ctx.ui.setStatus("optmem", `mem ${Math.floor(size / LOG_RECORD_BYTES)}${napState && ` · ${napState}`}`);
+		memoryCount = Math.floor(size / LOG_RECORD_BYTES);
+		if (!ctx.hasUI) return;
+		// Styled like a status-line segment: glyph and value in one colour (the
+		// memory tools' accent), extra facts after the theme's dot separator.
+		const t = ctx.ui.theme;
+		let status = t.fg("accent", `${t.symbol("tool.memory")} ${memoryCount}`);
+		if (sessionNotes.length) status += ` ${t.fg("success", `+${sessionNotes.length}`)}`;
+		if (napState === "nap failed") status += t.fg("statusLineSep", t.sep.dot) + t.fg("error", `${t.symbol("status.error")} ${napState}`);
+		else if (napState) status += t.fg("statusLineSep", t.sep.dot) + t.fg("warning", `${t.symbol("status.pending")} ${napState}`);
+		ctx.ui.setStatus("optmem", status);
 	}
 
 	// ------------------------------------------------------------ compression worker
@@ -170,7 +376,9 @@ export default function omptmem(pi: ExtensionAPI) {
 			napState = `napping ${remaining + 1}`;
 			await updateStatus(ctx);
 			const request = next.out.replace(/^Run: .*$/m, "").trim();
-			const saved = await memo(["nap", id, await compress(ctx, request, limit)]);
+			const line = await compress(ctx, request, limit);
+			const saved = await memo(["nap", id, line]);
+			if (saved.code === 0) summaries.set(id, line);
 			// A parallel session may have answered the same block first; the loop
 			// then simply asks memo for the next one.
 			if (saved.code !== 0 && !/settled/.test(saved.out)) throw new Error(saved.out);
@@ -202,6 +410,11 @@ export default function omptmem(pi: ExtensionAPI) {
 			void scheduleNaps(ctx);
 		}
 		snapshot = s;
+		if (s.kind === "awake") {
+			summaries.clear();
+			rememberSummaries(s.text);
+		}
+		observe(["config"], await memo(["config"]));
 		if (s.kind === "missing") {
 			ctx.ui.notify(`OptMem: no memory at ${MEMORY_DIR}. Run /memo init to create one.`, "warning");
 		}
@@ -265,6 +478,19 @@ ${s.text}
 			return;
 		}
 		startRefresh(ctx);
+		// omp's own memory (memory.backend) would run a second, unrelated store
+		// beside OptMem: two recall paths and two prompt blocks to keep in sync.
+		void ctx.memory
+			?.status()
+			.then(s => {
+				if (s.active && s.backend !== "off") {
+					ctx.ui.notify(
+						`OptMem: omp's memory.backend is "${s.backend}" too; set it to "off" so memories live in one place.`,
+						"warning",
+					);
+				}
+			})
+			.catch((error: unknown) => pi.logger.debug("optmem: memory backend status failed", { error: String(error) }));
 	});
 
 	// The system prompt is rebuilt from a snapshot only when the context is
@@ -315,6 +541,7 @@ ${s.text}
 			return { ...text("You are a subagent. Don't run memo."), isError: true };
 		}
 		const r = await memo(args, signal);
+		observe(args, r);
 		if (r.code === 0 && NAP_TRIGGERS[args[0]!]) void scheduleNaps(ctx);
 		if (r.code === 0 && args[0] === "note") {
 			sessionNotes.push(args[1]!);
@@ -324,24 +551,7 @@ ${s.text}
 		return { ...text(out), details: { args, code: r.code }, isError: r.code !== 0 };
 	}
 
-	/** One-line call and result views; the full output shows when expanded. */
-	function view(verb: string, argOf: (args: Record<string, string>) => string) {
-		return {
-			renderCall: (args: Record<string, string>, _o: unknown, theme: { fg(c: string, s: string): string; bold(s: string): string }) =>
-				new Text(`${theme.fg("toolTitle", theme.bold(`memo ${verb} `))}${theme.fg("muted", argOf(args))}`, 0, 0),
-			renderResult: (
-				result: { content: { type: string; text?: string }[]; isError?: boolean },
-				options: { expanded: boolean; isPartial: boolean },
-				theme: { fg(c: string, s: string): string },
-			) => {
-				if (options.isPartial) return new Text(theme.fg("muted", "…"), 0, 0);
-				const out = result.content.map(b => b.text ?? "").join("\n").trim();
-				const lines = out.split("\n");
-				const shown = options.expanded ? out : lines.length > 1 ? `${lines.at(-1)}  (${lines.length} lines)` : out;
-				return new Text(theme.fg(result.isError ? "error" : "success", shown), 0, 0);
-			},
-		};
-	}
+	const noteSubject = (a: { text: string }) => a.text;
 
 	// pi.zod schemas infer `unknown` params through registerTool in 18.12.x typings; the TypeBox shim infers.
 	const T = pi.typebox.Type;
@@ -356,7 +566,12 @@ ${s.text}
 		loadMode: "essential",
 		approval: "write",
 		execute: (_id, p, signal, _u, ctx) => run(["note", p.text], signal, ctx),
-		...view("note", a => a.text ?? ""),
+		...memoToolView("Memo Note", noteSubject, (out, a) => {
+			const id = out.match(/^Saved as (#\d+)\./)?.[1];
+			// The header clips the note at 80 columns; expanding shows all of it.
+			const long = a !== undefined && visibleWidth(noteSubject(a)) > 80;
+			return { meta: id && `saved ${id}`, rows: long ? [noteSubject(a)] : id ? [] : [out], preview: 0 };
+		}),
 	});
 
 	pi.registerTool({
@@ -367,7 +582,16 @@ ${s.text}
 		loadMode: "essential",
 		approval: "read",
 		execute: (_id, p, signal, _u, ctx) => run(["recall", p.regex], signal, ctx),
-		...view("recall", a => `/${a.regex ?? ""}/`),
+		...memoToolView(
+			"Memo Recall",
+			(a: { regex: string }) => `/${a.regex}/`,
+			out => {
+				const rows = out.split("\n");
+				const tally = rows.at(-1)?.match(/^(\d+ match(?:es)?|No match)\.$/)?.[1];
+				if (tally) rows.pop();
+				return { meta: tally?.toLowerCase(), rows, preview: PREVIEW_LIMITS.COLLAPSED_LINES, warn: tally === "No match" };
+			},
+		),
 	});
 
 	pi.registerTool({
@@ -378,7 +602,11 @@ ${s.text}
 		loadMode: "essential",
 		approval: "read",
 		execute: (_id, p, signal, _u, ctx) => run(["zoom", p.id], signal, ctx),
-		...view("zoom", a => `#${a.id ?? ""}`),
+		...memoToolView(
+			"Memo Zoom",
+			(a: { id: string }) => `#${a.id}`,
+			out => ({ rows: out.split("\n"), preview: PREVIEW_LIMITS.COLLAPSED_LINES }),
+		),
 	});
 
 	pi.registerTool({
@@ -390,20 +618,62 @@ ${s.text}
 		loadMode: "essential",
 		approval: "write",
 		execute: (_id, p, signal, _u, ctx) => run(["forget", p.id], signal, ctx),
-		...view("forget", a => `#${a.id ?? ""}`),
+		...memoToolView(
+			"Memo Forget",
+			(a: { id: string }) => `#${a.id}`,
+			out => {
+				const [first = "", ...rest] = out.split("\n");
+				return { meta: first.replace(/\.$/, "").replace(/^Forgot/, "forgot"), rows: rest, preview: 0 };
+			},
+		),
 	});
 
 	// ------------------------------------------------------------ command
 
+	/** `/memo` output in the transcript: the command as a status line, output under it. */
+	pi.registerMessageRenderer<{ args: string[]; code: number; output: string }>("optmem", (message, options, theme) => {
+		const d = message.details;
+		if (!d) return undefined;
+		const header = renderStatusLine(
+			{
+				icon: d.code ? "error" : undefined,
+				iconOverride: d.code ? undefined : theme.styledSymbol("tool.memory", "accent"),
+				title: "memo",
+				description: d.args.join(" ") || "help",
+				meta: d.code ? [`exit ${d.code}`] : undefined,
+			},
+			theme,
+		);
+		const view: MemoView = { rows: d.output ? d.output.split("\n") : [], preview: PREVIEW_LIMITS.EXPANDED_LINES };
+		const style = { bullet: false, color: d.code ? ("error" as const) : ("toolOutput" as const) };
+		return createCachedComponent(
+			() => options.expanded,
+			(width, expanded) => memoLines(header, view, expanded, width, theme, style),
+		);
+	});
+
 	pi.registerCommand("memo", {
 		description: "Run OptMem: /memo wake|note|nap|recall|zoom|forget|config|init [args]",
+		getArgumentCompletions: completeArgs,
 		handler: async (raw, ctx) => {
 			const args = splitArgs(raw);
 			const r = await memo(args[0] === "help" ? [] : args);
+			observe(args, r);
 			if (r.code === 0 && args[0] === "init") startRefresh(ctx);
 			else if (r.code === 0 && NAP_TRIGGERS[args[0] ?? ""]) void scheduleNaps(ctx);
+			// `nap` is asked for its pending request; elsewhere the worker answers it.
+			// init's AGENTS.md setup block is what this extension replaces.
+			const output = (args[0] === "nap" ? r.out : withoutNapRequest(r.out))
+				.replace(/\n+Paste this at the top of your agent's AGENTS\.md[\s\S]*$/, "")
+				.trimEnd();
 			pi.sendMessage(
-				{ customType: "optmem", content: `$ memo ${raw.trim()}\n${r.out || "(no output)"}`, display: true, attribution: "user" },
+				{
+					customType: "optmem",
+					content: `$ memo ${raw.trim()}\n${output || "(no output)"}`,
+					details: { args, code: r.code, output },
+					display: true,
+					attribution: "user",
+				},
 				{ triggerTurn: false },
 			);
 			if (r.code !== 0) ctx.ui.notify(`memo ${args[0] ?? ""} failed (exit ${r.code})`, "error");
