@@ -1,0 +1,19 @@
+{
+  "name": "omptmem",
+  "version": "0.1.0",
+  "description": "OptMem permanent memory, coupled into omp: auto-wake, native memo tools, subagent guard, nap enforcement.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["omp", "omp-plugin", "optmem", "memory"],
+  "files": ["src", "README.md"],
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.2",
+    "typescript": "^5.6.0"
+  }
+}
