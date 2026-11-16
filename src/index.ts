@@ -1,5 +1,5 @@
 /**
- * omptmem — OptMem (github.com/VictorTaelin/OptMem) coupled into omp.
+ * pi-optmem — OptMem (github.com/VictorTaelin/OptMem) coupled into omp.
  *
  * OptMem stays the single source of truth: every read and write goes through
  * its `memo` script, so sessions running under other harnesses share the same
@@ -47,10 +47,17 @@ const EXEC_TIMEOUT_MS = 30_000;
 const MAX_WAKE_PARTS = 64;
 /** One drain answers at most this many compressions; the next trigger resumes. */
 const MAX_NAPS_PER_DRAIN = 256;
-/** How long shutdown waits for an in-flight compression to land. */
-const SHUTDOWN_DRAIN_MS = 20_000;
+/**
+ * How long shutdown waits for an in-flight compression to land. omp cuts
+ * session_shutdown handlers at 2 s and reports a timeout error, so stay under it.
+ */
+const SHUTDOWN_DRAIN_MS = 1_500;
 const NOTHING_PENDING = "Nothing left to compress.";
 const NAP_ROLES = ["@optmem", "@smol"];
+/** Model tries per compression before the shortest reply is cut to fit. */
+const NAP_ATTEMPTS = 4;
+/** Asked-for size as a share of the hard limit: models miscount bytes. */
+const NAP_TARGET_RATIO = 0.8;
 const TOOL_NAMES = ["memo_note", "memo_recall", "memo_zoom", "memo_forget"];
 /** `/memo` subcommands offered by argument completion; `usage` is the ghost-text hint. */
 const SUBCOMMANDS: Record<string, { usage?: string; description: string }> = {
@@ -108,6 +115,18 @@ function text(t: string) {
 function withoutNapRequest(out: string): string {
 	const at = out.search(/^Compress memories #/m);
 	return (at < 0 ? out : out.slice(0, at)).replace(/\s*Run: \S*memo nap\s*$/, "").trimEnd();
+}
+
+/** Cut `line` to at most `limit` UTF-8 bytes, at the last space that fits when there is one. */
+function cutToBytes(line: string, limit: number): string {
+	const buf = Buffer.from(line);
+	if (buf.length <= limit) return line;
+	// Back off continuation bytes so no character is split.
+	let end = limit;
+	while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+	const head = buf.subarray(0, end).toString();
+	const space = head.lastIndexOf(" ");
+	return (space > head.length / 2 ? head.slice(0, space) : head).replace(/[\s,;:(-]+$/, "");
 }
 
 // ------------------------------------------------------------ rendering
@@ -201,7 +220,7 @@ function memoToolView<A>(title: string, describe: (args: A) => string, parse: (o
 	};
 }
 
-export default function omptmem(pi: ExtensionAPI) {
+export default function piOptmem(pi: ExtensionAPI) {
 	let snapshot: WakeSnapshot | undefined;
 	let ready: Promise<void> = Promise.resolve();
 	let naps: Promise<void> = Promise.resolve();
@@ -326,15 +345,26 @@ export default function omptmem(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------ compression worker
 
-	/** Answer one memo compression request with the nap model; returns the line. */
+	/**
+	 * Answer one memo compression request with the nap model; returns the line.
+	 * Models miscount bytes, so it asks for less than the limit, tells the model
+	 * how far over each reply went, and after NAP_ATTEMPTS cuts the shortest reply
+	 * at a word boundary: a stuck block would otherwise stop every later compression.
+	 */
 	async function compress(ctx: ExtensionContext, request: string, limit: number): Promise<string> {
 		const model = NAP_ROLES.map(role => ctx.models.resolve(role)).find(Boolean) ?? ctx.models.current();
 		if (!model) throw new Error("no model available for OptMem compression");
 		const sessionId = ctx.sessionManager.getSessionId();
+		const target = Math.floor(limit * NAP_TARGET_RATIO);
 		const messages: Parameters<typeof completeSimple>[1]["messages"] = [
-			{ role: "user", content: [{ type: "text", text: request }], timestamp: Date.now() },
+			{
+				role: "user",
+				content: [{ type: "text", text: `${request}\n\nAim for about ${target} bytes; ${limit} is the hard limit.` }],
+				timestamp: Date.now(),
+			},
 		];
-		for (let attempt = 0; attempt < 2; attempt++) {
+		let shortest = "";
+		for (let attempt = 0; attempt < NAP_ATTEMPTS; attempt++) {
 			const reply = await completeSimple(
 				model,
 				{ systemPrompt: [NAP_SYSTEM_PROMPT], messages },
@@ -351,16 +381,27 @@ export default function omptmem(pi: ExtensionAPI) {
 			const line = (raw.split("\n").find(l => l.trim()) ?? "").trim().replace(/^["'`]|["'`]$/g, "").trim();
 			const bytes = Buffer.byteLength(line);
 			if (line && bytes <= limit) {
-				pi.logger.debug("optmem: compressed", { model: `${model.provider}/${model.id}`, bytes });
+				pi.logger.debug("optmem: compressed", { model: `${model.provider}/${model.id}`, bytes, attempt });
 				return line;
 			}
+			if (line && (!shortest || bytes < Buffer.byteLength(shortest))) shortest = line;
 			messages.push(reply, {
 				role: "user",
-				content: [{ type: "text", text: `That was ${bytes} bytes. Reply with one line of at most ${limit} bytes.` }],
+				content: [
+					{
+						type: "text",
+						text: line
+							? `That was ${bytes} bytes, ${bytes - limit} over the ${limit}-byte limit. Rewrite it in at most ${target} bytes: drop the least important details and abbreviate. One line.`
+							: `Reply with the compressed memory: one line of at most ${target} bytes.`,
+					},
+				],
 				timestamp: Date.now(),
 			});
 		}
-		throw new Error(`${model.id} could not compress within ${limit} bytes`);
+		if (!shortest) throw new Error(`${model.id} returned no compression`);
+		const cut = cutToBytes(shortest, limit);
+		pi.logger.warn("optmem: compression cut to fit", { model: `${model.provider}/${model.id}`, from: Buffer.byteLength(shortest), to: Buffer.byteLength(cut) });
+		return cut;
 	}
 
 	/** Answer every pending compression, smallest block first, as memo orders them. */
