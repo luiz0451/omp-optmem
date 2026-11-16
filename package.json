@@ -1,5 +1,5 @@
 {
-  "name": "omptmem",
+  "name": "pi-optmem",
   "version": "0.1.0",
   "description": "OptMem permanent memory, coupled into omp: auto-wake, native memo tools, subagent guard, nap enforcement.",
   "type": "module",

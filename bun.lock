@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "omptmem",
+      "name": "pi-optmem",
       "devDependencies": {
         "@oh-my-pi/pi-coding-agent": "18.12.2",
         "typescript": "^5.6.0",
