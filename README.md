@@ -1,6 +1,6 @@
-# pi-optmem
+# omp-optmem
 
-Permanent memory for [omp](https://github.com/can1357/oh-my-pi), backed by [OptMem](https://github.com/VictorTaelin/OptMem).
+Permanent memory for [omp](https://github.com/can1357/oh-my-pi), backed by [OptMem](https://github.com/VictorTaelin/OptMem). For [Pi](https://github.com/earendil-works/pi), use its sibling repo `pi-optmem`; both drive the same `memo` script.
 
 - Every session starts with your memory already loaded into the agent's system prompt.
 - The agent saves and searches memories on its own with the `memo_note`, `memo_recall`, `memo_zoom` and `memo_forget` tools.
@@ -22,13 +22,13 @@ You need `omp`, `git` and `curl`.
 2. Get this plugin:
 
    ```sh
-   git clone https://github.com/luiz0451/pi-optmem.git ~/git/forgejo/pi-optmem
+   git clone https://github.com/luiz0451/omp-optmem.git ~/git/forgejo/omp-optmem
    ```
 
 3. Link it into omp:
 
    ```sh
-   omp plugin link ~/git/forgejo/pi-optmem
+   omp plugin link ~/git/forgejo/omp-optmem
    ```
 
 4. Create the memory (once per machine):
@@ -66,7 +66,7 @@ To look at or change the memory by hand, type `/memo` in omp (Tab completes the 
 ## Update
 
 ```sh
-git -C ~/git/forgejo/pi-optmem pull
+git -C ~/git/forgejo/omp-optmem pull
 ```
 
 Restart `omp` afterwards; the link always points at this folder.
@@ -75,7 +75,7 @@ Restart `omp` afterwards; the link always points at this folder.
 
 - **"no memory at ~/.optmem/memory"**: run step 4.
 - **The status line shows `nap failed`**: the compression model returned an error (usually auth or rate limits). The failed compression stays queued and is retried at the next session start or the next saved memory. `/memo nap` shows what is waiting.
-- **Plugin not loading**: `omp plugin list` should show `pi-optmem`; `omp plugin doctor --fix` repairs a broken link.
+- **Plugin not loading**: `omp plugin list` should show `omp-optmem`; `omp plugin doctor --fix` repairs a broken link.
 
 A compression has to fit in a fixed number of bytes. Models miscount bytes, so the plugin asks for less than the limit and tells the model how far over it went. After 4 tries it cuts the shortest answer at a word boundary, so one stubborn summary never blocks the rest.
 
@@ -89,7 +89,7 @@ A compression has to fit in a fixed number of bytes. Models miscount bytes, so t
 ## Uninstall
 
 ```sh
-omp plugin uninstall pi-optmem
+omp plugin uninstall omp-optmem
 ```
 
 The memory in `~/.optmem/memory` is left untouched.

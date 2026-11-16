@@ -1,5 +1,6 @@
 /**
- * pi-optmem — OptMem (github.com/VictorTaelin/OptMem) coupled into omp.
+ * omp-optmem — OptMem (github.com/VictorTaelin/OptMem) coupled into omp. Its Pi
+ * counterpart is the pi-optmem repo; both drive the same `memo` script.
  *
  * OptMem stays the single source of truth: every read and write goes through
  * its `memo` script, so sessions running under other harnesses share the same
@@ -220,7 +221,7 @@ function memoToolView<A>(title: string, describe: (args: A) => string, parse: (o
 	};
 }
 
-export default function piOptmem(pi: ExtensionAPI) {
+export default function ompOptmem(pi: ExtensionAPI) {
 	let snapshot: WakeSnapshot | undefined;
 	let ready: Promise<void> = Promise.resolve();
 	let naps: Promise<void> = Promise.resolve();
