@@ -1,95 +1,44 @@
 # omp-optmem
 
-Permanent memory for [omp](https://github.com/can1357/oh-my-pi), backed by [OptMem](https://github.com/VictorTaelin/OptMem). For [Pi](https://github.com/earendil-works/pi), use its sibling repo `pi-optmem`; both drive the same `memo` script.
+[OptMem](https://github.com/VictorTaelin/OptMem) permanent memory for [omp](https://github.com/can1357/oh-my-pi). For Pi, see `pi-optmem`.
 
-- Every session starts with your memory already loaded into the agent's system prompt.
-- The agent saves and searches memories on its own with the `memo_note`, `memo_recall`, `memo_zoom` and `memo_forget` tools.
-- Old memories are compressed into summaries in the background, with a cheap model.
-- All reads and writes go through OptMem's `memo` script, so any other agent that uses `~/.optmem/memory` shares the same memory.
+The agent starts every session with its memory loaded, saves and searches it with the `memo_*` tools, and old memories are compressed in the background.
 
 ## Install
 
-You need `omp`, `git` and `curl`.
+```sh
+curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
+~/.optmem/memo init
+git clone https://github.com/luiz0451/omp-optmem.git ~/git/forgejo/omp-optmem
+omp plugin link ~/git/forgejo/omp-optmem
+```
 
-1. Install OptMem:
+Skip the `## Memory` block OptMem asks you to add to `AGENTS.md`; the plugin does it.
 
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
-   ```
+Compression model (optional, `~/.omp/agent/config.yml`; default is `smol`, then the session model):
 
-   OptMem's instructions tell you to paste a `## Memory` block into `AGENTS.md`. Skip that: this plugin does it for you.
-
-2. Get this plugin:
-
-   ```sh
-   git clone https://github.com/luiz0451/omp-optmem.git ~/git/forgejo/omp-optmem
-   ```
-
-3. Link it into omp:
-
-   ```sh
-   omp plugin link ~/git/forgejo/omp-optmem
-   ```
-
-4. Create the memory (once per machine):
-
-   ```sh
-   ~/.optmem/memo init
-   ```
-
-5. Pick the model that compresses memories. A small, fast one is enough. Add to `~/.omp/agent/config.yml`:
-
-   ```yaml
-   modelRoles:
-     optmem: anthropic/claude-haiku-5-5
-   ```
-
-   Without it, the `smol` role is used, then the session's model.
-
-6. Start `omp`. The status line shows the memory icon and how many memories you have, `+N` for the ones saved this session, and `napping N` while compressions run.
+```yaml
+modelRoles:
+  optmem: anthropic/claude-haiku-5-5
+```
 
 ## Use
 
-You don't have to do anything: the agent records what is worth keeping and reads it back in later sessions.
+Nothing to do: the agent handles it. By hand, `/memo` in omp:
 
-To look at or change the memory by hand, type `/memo` in omp (Tab completes the commands and block ids):
-
-| Command | What it does |
-|---|---|
-| `/memo recall bun` | Search every memory ever recorded (regex, case-insensitive) |
-| `/memo note "prefers tabs"` | Save one memory yourself (one line, at most 280 bytes) |
-| `/memo zoom 0-15` | Open a summary into the two halves it was built from |
-| `/memo forget 0-15` | Drop a bad summary; it is rebuilt in the background |
-| `/memo nap` | Show the compressions still waiting |
-| `/memo config` | Show the memory's sizes; `/memo config WAKE_LINES=200` changes one |
-
-## Update
-
-```sh
-git -C ~/git/forgejo/omp-optmem pull
+```
+/memo recall <regex>     search all memories
+/memo note "<line>"      save one (max 280 bytes)
+/memo zoom 0-15          open a summary
+/memo forget 0-15        rebuild a bad summary
+/memo nap                pending compressions
 ```
 
-Restart `omp` afterwards; the link always points at this folder.
-
-## Troubleshooting
-
-- **"no memory at ~/.optmem/memory"**: run step 4.
-- **The status line shows `nap failed`**: the compression model returned an error (usually auth or rate limits). The failed compression stays queued and is retried at the next session start or the next saved memory. `/memo nap` shows what is waiting.
-- **Plugin not loading**: `omp plugin list` should show `omp-optmem`; `omp plugin doctor --fix` repairs a broken link.
-
-A compression has to fit in a fixed number of bytes. Models miscount bytes, so the plugin asks for less than the limit and tells the model how far over it went. After 4 tries it cuts the shortest answer at a word boundary, so one stubborn summary never blocks the rest.
-
-## Settings
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPTMEM_MEMO` | `~/.optmem/memo` | Path to OptMem's `memo` script |
-| `MEMORY_DIR` | `~/.optmem/memory` | Where the memory lives |
-
-## Uninstall
+## Update / remove
 
 ```sh
-omp plugin uninstall omp-optmem
+git -C ~/git/forgejo/omp-optmem pull     # then restart omp
+omp plugin uninstall omp-optmem          # memory stays in ~/.optmem
 ```
 
-The memory in `~/.optmem/memory` is left untouched.
+`OPTMEM_MEMO` and `MEMORY_DIR` override the script and memory paths.
