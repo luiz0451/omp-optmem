@@ -1,6 +1,6 @@
 # omp-optmem
 
-[OptMem](https://github.com/VictorTaelin/OptMem) permanent memory for [omp](https://github.com/can1357/oh-my-pi). For Pi, see `pi-optmem`.
+[OptMem](https://github.com/VictorTaelin/OptMem) permanent memory for [omp](https://github.com/can1357/oh-my-pi). For Pi, see [pi-optmem](https://github.com/luiz0451/pi-optmem).
 
 The agent starts every session with its memory loaded, saves and searches it with the `memo_*` tools, and old memories are compressed in the background.
 
@@ -9,8 +9,8 @@ The agent starts every session with its memory loaded, saves and searches it wit
 ```sh
 curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
 ~/.optmem/memo init
-git clone https://github.com/luiz0451/omp-optmem.git ~/git/forgejo/omp-optmem
-omp plugin link ~/git/forgejo/omp-optmem
+git clone https://github.com/luiz0451/omp-optmem.git ~/omp-optmem
+omp plugin link ~/omp-optmem
 ```
 
 Skip the `## Memory` block OptMem asks you to add to `AGENTS.md`; the plugin does it.
@@ -37,8 +37,12 @@ Nothing to do: the agent handles it. By hand, `/memo` in omp:
 ## Update / remove
 
 ```sh
-git -C ~/git/forgejo/omp-optmem pull     # then restart omp
+git -C ~/omp-optmem pull                 # then restart omp
 omp plugin uninstall omp-optmem          # memory stays in ~/.optmem
 ```
 
 `OPTMEM_MEMO` and `MEMORY_DIR` override the script and memory paths.
+
+## License
+
+MIT
